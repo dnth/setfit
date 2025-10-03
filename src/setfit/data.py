@@ -1,11 +1,14 @@
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from pathlib import Path
 
 import pandas as pd
 import torch
 from datasets import Dataset, DatasetDict, load_dataset
 from torch.utils.data import Dataset as TorchDataset
+from PIL import Image
 
 from . import logging
+from .image_utils import ImageTransform, get_image_transforms, load_image, create_image_dataset_from_directory
 
 
 logging.set_verbosity_info()
@@ -271,3 +274,190 @@ class SetFitDataset(TorchDataset):
         labels = torch.Tensor(labels)
         labels = labels.long() if len(labels.size()) == 1 else labels.float()
         return features, labels
+
+
+class SetFitImageDataset(TorchDataset):
+    """SetFitImageDataset
+
+    A dataset for training the differentiable head on image classification.
+
+    Args:
+        x (`List[Union[str, Path]]`):
+            A list of image paths that will be fed into `SetFitImageModel`.
+        y (`Union[List[int], List[List[int]]]`):
+            A list of labels corresponding to the images. Can be a nested list for multi-label classification.
+        transform (`ImageTransform`, *optional*):
+            The image transformation pipeline to apply. If None, uses default transforms.
+        image_size (`Tuple[int, int]`, defaults to `(224, 224)`):
+            The target size for images (height, width).
+    """
+
+    def __init__(
+        self,
+        x: List[Union[str, Path]],
+        y: Union[List[int], List[List[int]]],
+        transform: Optional[ImageTransform] = None,
+        image_size: Tuple[int, int] = (224, 224),
+    ) -> None:
+        assert len(x) == len(y)
+
+        self.x = [Path(path) for path in x]  # Ensure all paths are Path objects
+        self.y = y
+        self.image_size = image_size
+
+        # Create default transform if not provided
+        if transform is None:
+            transform = get_image_transforms(
+                image_size=image_size,
+                is_training=True,
+            )
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.x)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Union[int, List[int]]]:
+        """Get an image and its label.
+
+        Args:
+            idx: Index of the item
+
+        Returns:
+            Tuple of (transformed_image_tensor, label)
+        """
+        image_path = self.x[idx]
+        label = self.y[idx]
+
+        # Load and transform image
+        try:
+            image = load_image(image_path)
+            image_tensor = self.transform(image)
+        except Exception as e:
+            raise ValueError(f"Error loading image {image_path}: {e}")
+
+        return image_tensor, label
+
+    def collate_fn(self, batch):
+        """Collate function for DataLoader.
+
+        Args:
+            batch: List of (image_tensor, label) tuples
+
+        Returns:
+            Tuple of (batched_images, batched_labels)
+        """
+        images = []
+        labels = []
+
+        for image_tensor, label in batch:
+            images.append(image_tensor)
+            labels.append(label)
+
+        # Stack images into batch
+        images = torch.stack(images, dim=0)
+
+        # Convert labels to tensor
+        labels = torch.tensor(labels)
+        labels = labels.long() if len(labels.size()) == 1 else labels.float()
+
+        return images, labels
+
+
+def load_image_dataset(
+    dataset_path: Union[str, Path],
+    extensions: Tuple[str, ...] = (".jpg", ".jpeg", ".png", ".bmp", ".tiff"),
+) -> Dict[str, List[Path]]:
+    """Load an image dataset from a directory structure.
+
+    Args:
+        dataset_path: Path to the dataset directory
+        extensions: Valid image file extensions
+
+    Returns:
+        Dictionary mapping class names to lists of image paths
+    """
+    return create_image_dataset_from_directory(dataset_path, extensions)
+
+
+def create_image_classification_dataset(
+    image_paths: List[Union[str, Path]],
+    labels: List[Union[str, int]],
+    label_to_id: Optional[Dict[str, int]] = None,
+) -> Tuple[List[Path], List[int], Dict[str, int]]:
+    """Create a classification dataset from image paths and labels.
+
+    Args:
+        image_paths: List of image file paths
+        labels: List of corresponding labels (strings or integers)
+        label_to_id: Optional mapping from string labels to integers
+
+    Returns:
+        Tuple of (processed_image_paths, integer_labels, label_to_id_mapping)
+    """
+    # Convert all paths to Path objects
+    processed_paths = [Path(path) for path in image_paths]
+
+    # Handle label mapping
+    if label_to_id is None:
+        unique_labels = sorted(set(labels))
+        label_to_id = {label: idx for idx, label in enumerate(unique_labels)}
+
+    # Convert string labels to integers
+    integer_labels = []
+    for label in labels:
+        if isinstance(label, str):
+            if label not in label_to_id:
+                raise ValueError(f"Unknown label: {label}")
+            integer_labels.append(label_to_id[label])
+        else:
+            integer_labels.append(label)
+
+    return processed_paths, integer_labels, label_to_id
+
+
+def get_image_statistics(
+    image_paths: List[Union[str, Path]]
+) -> Dict[str, Union[int, float, Tuple[int, int]]]:
+    """Get statistics about a collection of images.
+
+    Args:
+        image_paths: List of image file paths
+
+    Returns:
+        Dictionary with image statistics
+    """
+    if not image_paths:
+        return {"count": 0}
+
+    sizes = []
+    total_size = 0
+
+    for path in image_paths:
+        path = Path(path)
+        if path.exists():
+            # Get image size
+            try:
+                with Image.open(path) as img:
+                    sizes.append(img.size)
+                    total_size += path.stat().st_size
+            except Exception:
+                continue
+
+    if not sizes:
+        return {"count": 0, "error": "No valid images found"}
+
+    # Calculate statistics
+    widths, heights = zip(*sizes)
+    avg_width = sum(widths) / len(widths)
+    avg_height = sum(heights) / len(heights)
+    min_size = (min(widths), min(heights))
+    max_size = (max(widths), max(heights))
+
+    return {
+        "count": len(sizes),
+        "total_size_bytes": total_size,
+        "average_size": (avg_width, avg_height),
+        "min_size": min_size,
+        "max_size": max_size,
+        "unique_sizes": len(set(sizes)),
+    }

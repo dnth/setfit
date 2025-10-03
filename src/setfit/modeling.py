@@ -22,9 +22,11 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm, trange
 from transformers.utils import copy_func
+from PIL import Image
 
 from . import logging
 from .data import SetFitDataset
+from .image_utils import TimmModelWrapper, ImageTransform, get_image_transforms
 from .model_card import SetFitModelCardData, generate_model_card
 from .utils import set_docstring
 
@@ -188,6 +190,218 @@ class SetFitHead(models.Dense):
         return "SetFitHead({})".format(self.get_config_dict())
 
 
+class SetFitImageEncoder:
+    """A wrapper for TIMM image models that provides a consistent interface with SentenceTransformer.
+
+    This class allows using TIMM computer vision models as encoders in SetFit,
+    providing feature extraction capabilities for image classification tasks.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "resnet50",
+        pretrained: bool = True,
+        image_size: Tuple[int, int] = (224, 224),
+        device: Optional[Union[str, torch.device]] = None,
+    ):
+        """Initialize the TIMM image encoder.
+
+        Args:
+            model_name: Name of the TIMM model to use
+            pretrained: Whether to use pretrained weights
+            image_size: Input image size (height, width)
+            device: Device to load the model on
+        """
+        self.model_name = model_name
+        self.image_size = image_size
+
+        # Initialize TIMM model wrapper
+        self.timm_model = TimmModelWrapper(
+            model_name=model_name,
+            pretrained=pretrained,
+            image_size=image_size,
+            device=device,
+        )
+
+        # Create default transform
+        self.transform = get_image_transforms(
+            image_size=image_size,
+            is_training=False,
+            model_name=model_name,
+        )
+
+        # For compatibility with SentenceTransformer interface
+        self._target_device = self.timm_model.device
+
+        # Create a dummy tokenizer for compatibility
+        self.tokenizer = None
+
+    def encode(
+        self,
+        images: Union[Image.Image, List[Image.Image], torch.Tensor],
+        batch_size: int = 32,
+        show_progress_bar: bool = False,
+        convert_to_tensor: bool = True,
+        normalize_embeddings: bool = False,
+    ) -> Union[torch.Tensor, np.ndarray]:
+        """Encode images into embeddings.
+
+        Args:
+            images: PIL Images, list of PIL Images, or tensor of images
+            batch_size: Batch size for processing
+            show_progress_bar: Whether to show progress bar
+            convert_to_tensor: Whether to return PyTorch tensor
+            normalize_embeddings: Whether to normalize embeddings
+
+        Returns:
+            Image embeddings
+        """
+        # Handle different input types
+        if isinstance(images, Image.Image):
+            images = [images]
+        elif isinstance(images, torch.Tensor):
+            # Assume tensor is already preprocessed
+            pass
+        elif isinstance(images, (list, tuple)):
+            # List of PIL Images or paths
+            processed_images = []
+            for img in images:
+                if isinstance(img, (str, Path)):
+                    img = Image.open(img).convert("RGB")
+                processed_images.append(img)
+            images = processed_images
+
+        # Process in batches if we have PIL images
+        if isinstance(images, list) and isinstance(images[0], Image.Image):
+            all_embeddings = []
+
+            for i in range(0, len(images), batch_size):
+                batch = images[i:i + batch_size]
+
+                # Convert PIL images to tensors
+                batch_tensors = []
+                for img in batch:
+                    if isinstance(img, Image.Image):
+                        tensor = self.transform(img)
+                    else:
+                        tensor = img
+                    batch_tensors.append(tensor)
+
+                batch_tensor = torch.stack(batch_tensors, dim=0)
+                embeddings = self.timm_model.encode(batch_tensor)
+
+                if normalize_embeddings:
+                    embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+
+                all_embeddings.append(embeddings)
+
+            embeddings = torch.cat(all_embeddings, dim=0)
+        else:
+            # Assume tensor input
+            embeddings = self.timm_model.encode(images)
+
+            if normalize_embeddings:
+                embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+
+        if convert_to_tensor:
+            return embeddings
+        else:
+            return embeddings.cpu().numpy()
+
+    def get_sentence_embedding_dimension(self) -> int:
+        """Get the dimension of the image embeddings."""
+        return self.timm_model.get_feature_dim()
+
+    def get_max_seq_length(self) -> int:
+        """Get maximum sequence length (not applicable for images, returns image size)."""
+        return self.image_size[0] * self.image_size[1]
+
+    def save(self, path: Union[str, Path], create_model_card: bool = True):
+        """Save the image encoder to disk.
+
+        Args:
+            path: Directory to save to
+            create_model_card: Whether to create model card
+        """
+        path = Path(path)
+        path.mkdir(exist_ok=True, parents=True)
+
+        # Save model configuration
+        config = {
+            "model_name": self.model_name,
+            "image_size": self.image_size,
+        }
+
+        with open(path / "image_encoder_config.json", "w") as f:
+            json.dump(config, f)
+
+        # Note: TIMM models would need to be saved separately
+        # For now, we rely on the model being available via TIMM hub
+
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> "SetFitImageEncoder":
+        """Load an image encoder from disk.
+
+        Args:
+            path: Directory to load from
+
+        Returns:
+            Loaded SetFitImageEncoder instance
+        """
+        path = Path(path)
+
+        # Load configuration
+        with open(path / "image_encoder_config.json", "r") as f:
+            config = json.load(f)
+
+        # Create new instance
+        return cls(
+            model_name=config["model_name"],
+            image_size=tuple(config["image_size"]),
+        )
+
+    @property
+    def device(self) -> torch.device:
+        """Get the device the model is on."""
+        return self.timm_model.device
+
+    def to(self, device: Union[str, torch.device]) -> "SetFitImageEncoder":
+        """Move model to device."""
+        self.timm_model.to(device)
+        self._target_device = self.timm_model.device
+        return self
+
+    def tokenize(self, text: Union[str, List[str]]) -> Dict[str, torch.Tensor]:
+        """Dummy tokenize method for compatibility with SentenceTransformer interface.
+
+        Note: This method is not used for image models but is required for compatibility.
+
+        Args:
+            text: Text input (ignored for image models)
+
+        Returns:
+            Empty dictionary for compatibility
+        """
+        # Return empty dict for compatibility - not used in image models
+        return {}
+
+    def parameters(self):
+        """Get the parameters of the underlying TIMM model for optimization.
+
+        Returns:
+            Iterator of model parameters
+        """
+        return self.timm_model.model.parameters()
+
+    def train(self, mode: bool = True):
+        """Set the model to training or evaluation mode.
+
+        Args:
+            mode: If True, set to training mode. If False, set to evaluation mode.
+        """
+        self.timm_model.model.train(mode)
+
+
 class SetFitModel(ModelHubMixin):
     """A SetFit model with integration to the [Hugging Face Hub](https://huggingface.co).
 
@@ -314,7 +528,7 @@ class SetFitModel(ModelHubMixin):
             if not end_to_end:
                 self.unfreeze("body")
         else:  # train with sklearn
-            embeddings = self.model_body.encode(list(x_train), normalize_embeddings=self.normalize_embeddings)
+            embeddings = self.model_body.encode(list(x_train), normalize_embeddings=self.normalize_embeddings, convert_to_tensor=self.has_differentiable_head)
             self.model_head.fit(embeddings, list(y_train))
             if self.labels is None and self.multi_target_strategy is None:
                 # Try to set the labels based on the head classes, if they exist
@@ -921,3 +1135,181 @@ SetFitModel.save_pretrained = copy_func(SetFitModel.save_pretrained)
 SetFitModel.save_pretrained.__doc__ = SetFitModel.save_pretrained.__doc__.replace(
     "~ModelHubMixin._from_pretrained", "SetFitModel.push_to_hub"
 )
+
+
+class SetFitImageModel(SetFitModel):
+    """SetFit model for image classification using TIMM encoders.
+
+    This class extends SetFitModel to work with image data using TIMM models
+    for feature extraction instead of SentenceTransformer.
+    """
+
+    def __init__(
+        self,
+        model_body: Optional[SetFitImageEncoder] = None,
+        model_head: Optional[Union[SetFitHead, LogisticRegression]] = None,
+        multi_target_strategy: Optional[str] = None,
+        normalize_embeddings: bool = False,
+        labels: Optional[List[str]] = None,
+        model_card_data: Optional[SetFitModelCardData] = None,
+        image_size: Tuple[int, int] = (224, 224),
+        timm_model_name: str = "resnet50",
+        **kwargs,
+    ):
+        """Initialize SetFit image model.
+
+        Args:
+            model_body: TIMM image encoder (if None, will be created)
+            model_head: Classification head
+            multi_target_strategy: Multi-target strategy
+            normalize_embeddings: Whether to normalize embeddings
+            labels: List of class labels
+            model_card_data: Model card data
+            image_size: Input image size
+            timm_model_name: TIMM model name to use
+            **kwargs: Additional arguments
+        """
+        # Create image encoder if not provided
+        if model_body is None:
+            model_body = SetFitImageEncoder(
+                model_name=timm_model_name,
+                image_size=image_size,
+            )
+
+        # Initialize parent class
+        super().__init__(
+            model_body=model_body,
+            model_head=model_head,
+            multi_target_strategy=multi_target_strategy,
+            normalize_embeddings=normalize_embeddings,
+            labels=labels,
+            model_card_data=model_card_data,
+            **kwargs,
+        )
+
+        # Store image-specific attributes
+        self.image_size = image_size
+        self.timm_model_name = timm_model_name
+
+        # Create default head if not provided
+        if self.model_head is None:
+            from sklearn.linear_model import LogisticRegression
+            self.model_head = LogisticRegression()
+
+        # Update attributes to save
+        self.attributes_to_save.update({"image_size", "timm_model_name"})
+
+    def encode(
+        self,
+        inputs: Union[str, Path, Image.Image, List[Union[str, Path, Image.Image]]],
+        batch_size: int = 32,
+        show_progress_bar: Optional[bool] = None,
+    ) -> Union[torch.Tensor, np.ndarray]:
+        """Encode images into embeddings.
+
+        Args:
+            inputs: Image paths, PIL Images, or mixed list
+            batch_size: Batch size for processing
+            show_progress_bar: Whether to show progress bar
+
+        Returns:
+            Image embeddings
+        """
+        return self.model_body.encode(
+            inputs,
+            batch_size=batch_size,
+            show_progress_bar=show_progress_bar,
+            convert_to_tensor=self.has_differentiable_head,
+            normalize_embeddings=self.normalize_embeddings,
+        )
+
+    def predict(
+        self,
+        inputs: Union[str, Path, Image.Image, List[Union[str, Path, Image.Image]]],
+        batch_size: int = 32,
+        as_numpy: bool = False,
+        use_labels: bool = True,
+        show_progress_bar: Optional[bool] = None,
+    ) -> Union[torch.Tensor, np.ndarray, List[str], int, str]:
+        """Predict classes for images.
+
+        Args:
+            inputs: Image paths, PIL Images, or mixed list
+            batch_size: Batch size for processing
+            as_numpy: Whether to return numpy arrays
+            use_labels: Whether to return label strings
+            show_progress_bar: Whether to show progress bar
+
+        Returns:
+            Predictions (labels or indices)
+        """
+        # Convert single input to list
+        is_singular = False
+        if isinstance(inputs, (str, Path, Image.Image)):
+            inputs = [inputs]
+            is_singular = True
+
+        # Encode images
+        embeddings = self.encode(
+            inputs,
+            batch_size=batch_size,
+            show_progress_bar=show_progress_bar,
+        )
+
+        # Get predictions from head
+        preds = self.model_head.predict(embeddings)
+
+        # Convert to labels if needed
+        if (
+            use_labels
+            and self.labels
+            and preds.ndim == 1
+            and (self.has_differentiable_head or preds.dtype.char != "U")
+        ):
+            outputs = [self.labels[int(pred)] for pred in preds]
+        else:
+            outputs = self._output_type_conversion(preds, as_numpy=as_numpy)
+
+        return outputs[0] if is_singular else outputs
+
+    def predict_proba(
+        self,
+        inputs: Union[str, Path, Image.Image, List[Union[str, Path, Image.Image]]],
+        batch_size: int = 32,
+        as_numpy: bool = False,
+        show_progress_bar: Optional[bool] = None,
+    ) -> Union[torch.Tensor, np.ndarray]:
+        """Predict class probabilities for images.
+
+        Args:
+            inputs: Image paths, PIL Images, or mixed list
+            batch_size: Batch size for processing
+            as_numpy: Whether to return numpy arrays
+            show_progress_bar: Whether to show progress bar
+
+        Returns:
+            Class probabilities
+        """
+        # Convert single input to list
+        is_singular = False
+        if isinstance(inputs, (str, Path, Image.Image)):
+            inputs = [inputs]
+            is_singular = True
+
+        # Encode images
+        embeddings = self.encode(
+            inputs,
+            batch_size=batch_size,
+            show_progress_bar=show_progress_bar,
+        )
+
+        # Get probabilities from head
+        probs = self.model_head.predict_proba(embeddings)
+        if isinstance(probs, list):
+            if self.has_differentiable_head:
+                probs = torch.stack(probs, axis=1)
+            else:
+                probs = np.stack(probs, axis=1)
+
+        outputs = self._output_type_conversion(probs, as_numpy=as_numpy)
+        return outputs[0] if is_singular else outputs

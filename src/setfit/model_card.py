@@ -29,7 +29,7 @@ from . import logging
 logger = logging.get_logger(__name__)
 
 if TYPE_CHECKING:
-    from setfit.modeling import SetFitModel
+    from setfit.modeling import SetFitModel, SetFitImageModel
     from setfit.trainer import Trainer
 
 
@@ -259,6 +259,11 @@ class SetFitModelCardData(CardData):
     # ABSA-related arguments
     absa: Dict[str, Any] = field(default=None, init=False, repr=False)
 
+    # Image-specific arguments
+    timm_model_name: Optional[str] = field(default=None, init=False)
+    image_size: Optional[Tuple[int, int]] = field(default=None, init=False)
+    is_image_model: bool = field(default=False, init=False)
+
     # Passed via `register_model` only
     model: Optional["SetFitModel"] = field(default=None, init=False, repr=False)
     head_class: Optional[str] = field(default=None, init=False, repr=False)
@@ -295,12 +300,22 @@ class SetFitModelCardData(CardData):
         self.best_model_step = step
 
     def set_widget_examples(self, dataset: Dataset) -> None:
-        samples = dataset.select(random.sample(range(len(dataset)), k=min(len(dataset), 5)))["text"]
-        self.widget = [{"text": sample} for sample in samples]
+        # Handle image datasets vs text datasets
+        if "image_path" in dataset.column_names:
+            # Image dataset
+            samples = dataset.select(random.sample(range(len(dataset)), k=min(len(dataset), 5)))["image_path"]
+            self.widget = [{"image": sample} for sample in samples]
 
-        samples = sorted(list(samples), key=len)
-        if samples:
-            self.predict_example = samples[0]
+            if samples:
+                self.predict_example = samples[0]
+        else:
+            # Text dataset (original behavior)
+            samples = dataset.select(random.sample(range(len(dataset)), k=min(len(dataset), 5)))["text"]
+            self.widget = [{"text": sample} for sample in samples]
+
+            samples = sorted(list(samples), key=len)
+            if samples:
+                self.predict_example = samples[0]
 
     def set_train_set_metrics(self, dataset: Dataset) -> None:
         def add_naive_word_count(sample: Dict[str, Any]) -> Dict[str, Any]:
@@ -419,13 +434,33 @@ class SetFitModelCardData(CardData):
             "SetFitHead": "[SetFitHead](huggingface.co/docs/setfit/reference/main#setfit.SetFitHead)",
         }.get(head_class, head_class)
 
-        if not self.model_name:
-            if self.st_id:
-                self.model_name = f"SetFit with {self.st_id}"
+        # Check if this is an image model
+        if hasattr(model, 'timm_model_name'):
+            self.is_image_model = True
+            self.timm_model_name = model.timm_model_name
+            self.image_size = model.image_size
+            self.pipeline_tag = "image-classification"
+
+            # Update tags for image classification
+            if self.tags:
+                # Remove text-specific tags and add image-specific ones
+                self.tags = [tag for tag in self.tags if tag != "text-classification"]
+                self.tags.extend(["image-classification", "timm", "computer-vision"])
+
+            if not self.model_name:
+                self.model_name = f"SetFit Image Classification with {self.timm_model_name}"
                 if self.dataset_name or self.dataset_id:
                     self.model_name += f" on {self.dataset_name or self.dataset_id}"
-            else:
-                self.model_name = "SetFit"
+        else:
+            # Text model
+            self.is_image_model = False
+            if not self.model_name:
+                if self.st_id:
+                    self.model_name = f"SetFit with {self.st_id}"
+                    if self.dataset_name or self.dataset_id:
+                        self.model_name += f" on {self.dataset_name or self.dataset_id}"
+                else:
+                    self.model_name = "SetFit"
 
         self.inference = self.model.multi_target_strategy is None
 
@@ -534,7 +569,16 @@ class SetFitModelCardData(CardData):
             super_dict["datasets"] = [self.dataset_id]
         if self.st_id:
             super_dict["base_model"] = self.st_id
-        super_dict["model_max_length"] = self.model.model_body.get_max_seq_length()
+
+        # Add image-specific metadata
+        if self.is_image_model and self.timm_model_name:
+            super_dict["timm_model"] = self.timm_model_name
+        if self.is_image_model and self.image_size:
+            super_dict["image_size"] = f"{self.image_size[0]}x{self.image_size[1]}"
+
+        # Handle max length for both text and image models
+        if hasattr(self.model.model_body, 'get_max_seq_length'):
+            super_dict["model_max_length"] = self.model.model_body.get_max_seq_length()
         if super_dict["num_classes"] is None:
             if self.model.labels:
                 super_dict["num_classes"] = len(self.model.labels)

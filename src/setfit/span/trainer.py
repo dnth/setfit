@@ -8,7 +8,8 @@ from setfit.span.modeling import AbsaModel, AspectModel, PolarityModel
 from setfit.training_args import TrainingArguments
 
 from .. import logging
-from ..trainer import ColumnMappingMixin, Trainer
+from ..trainer import ColumnMappingMixin
+from ..trainer import Trainer
 
 
 if TYPE_CHECKING:

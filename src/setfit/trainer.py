@@ -25,12 +25,14 @@ from .losses import SupConLoss
 from .sampler import ContrastiveDataset
 from .training_args import TrainingArguments
 from .utils import BestRun, default_hp_space_optuna
+from .data import SetFitImageDataset
+from .image_utils import ImageTransform
 
 
 if TYPE_CHECKING:
     import optuna
 
-    from .modeling import SetFitModel
+    from .modeling import SetFitModel, SetFitImageModel
 
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
@@ -47,11 +49,25 @@ class BCSentenceTransformersTrainer(SentenceTransformerTrainer):
         self._setfit_model = setfit_model
         self._setfit_args = setfit_args
         self.logs_prefix = "embedding"
-        super().__init__(
-            model=setfit_model.model_body,
-            args=SentenceTransformerTrainingArguments(output_dir=setfit_args.output_dir),
-            **kwargs,
-        )
+
+        # Check if this is an image model
+        is_image_model = hasattr(setfit_model.model_body, 'timm_model')
+
+        if is_image_model:
+            # For image models, we need to handle this differently
+            # Create a minimal setup without SentenceTransformer trainer
+            from sentence_transformers.training_args import SentenceTransformerTrainingArguments
+            st_args = SentenceTransformerTrainingArguments(output_dir=setfit_args.output_dir)
+            self.args = st_args
+            self.model = setfit_model.model_body
+            # Skip the parent __init__ for image models since they don't need tokenization
+        else:
+            # Original behavior for text models
+            super().__init__(
+                model=setfit_model.model_body,
+                args=SentenceTransformerTrainingArguments(output_dir=setfit_args.output_dir),
+                **kwargs,
+            )
         self._apply_training_arguments(setfit_args)
 
         for callback in list(self.callback_handler.callbacks):
@@ -338,11 +354,21 @@ class Trainer(ColumnMappingMixin):
         self.hp_search_backend = None
 
         callbacks = callbacks + [ModelCardCallback(self)] if callbacks else [ModelCardCallback(self)]
-        self.st_trainer = BCSentenceTransformersTrainer(
-            setfit_model=model,
-            setfit_args=self.args,
-            callbacks=callbacks,
-        )
+
+        # Check if this is an image model
+        is_image_model = hasattr(model, 'timm_model_name')
+
+        if is_image_model:
+            # For image models, create a simplified trainer setup
+            self.st_trainer = None
+            # We'll handle training differently for image models
+        else:
+            # Original behavior for text models
+            self.st_trainer = BCSentenceTransformersTrainer(
+                setfit_model=model,
+                setfit_args=self.args,
+                callbacks=callbacks,
+            )
 
     @property
     def args(self) -> TrainingArguments:
@@ -351,7 +377,7 @@ class Trainer(ColumnMappingMixin):
     @args.setter
     def args(self, args: TrainingArguments) -> None:
         self._args = args
-        if hasattr(self, "st_trainer"):
+        if hasattr(self, "st_trainer") and self.st_trainer is not None:
             self.st_trainer.setfit_args = args
 
     @property
@@ -361,7 +387,7 @@ class Trainer(ColumnMappingMixin):
     @model.setter
     def model(self, model: "SetFitModel") -> None:
         self._model = model
-        if hasattr(self, "st_trainer"):
+        if hasattr(self, "st_trainer") and self.st_trainer is not None:
             self.st_trainer.setfit_model = model
 
     def add_callback(self, callback: Union[type, TrainerCallback]) -> None:
@@ -373,7 +399,8 @@ class Trainer(ColumnMappingMixin):
                A [`~transformers.TrainerCallback`] class or an instance of a [`~transformers.TrainerCallback`]. In the
                first case, will instantiate a member of that class.
         """
-        self.st_trainer.add_callback(callback)
+        if self.st_trainer is not None:
+            self.st_trainer.add_callback(callback)
 
     def pop_callback(self, callback: Union[type, TrainerCallback]) -> TrainerCallback:
         """
@@ -382,25 +409,28 @@ class Trainer(ColumnMappingMixin):
         If the callback is not found, returns `None` (and no error is raised).
 
         Args:
-           callback (`type` or [`~transformers.TrainerCallback`]):
-               A [`~transformers.TrainerCallback`] class or an instance of a [`~transformers.TrainerCallback`]. In the
-               first case, will pop the first member of that class found in the list of callbacks.
+            callback (`type` or [`~transformers.TrainerCallback`]):
+                A [`~transformers.TrainerCallback`] class or an instance of a [`~transformers.TrainerCallback`]. In the
+                first case, will pop the first member of that class found in the list of callbacks.
 
         Returns:
             [`~transformers.TrainerCallback`]: The callback removed, if found.
         """
-        return self.st_trainer.pop_callback(callback)
+        if self.st_trainer is not None:
+            return self.st_trainer.pop_callback(callback)
+        return None
 
     def remove_callback(self, callback: Union[type, TrainerCallback]) -> None:
         """
         Remove a callback from the current list of [`~transformers.TrainerCallback`].
 
         Args:
-           callback (`type` or [`~transformers.TrainerCallback`]):
-               A [`~transformers.TrainerCallback`] class or an instance of a [`~transformers.TrainerCallback`]. In the
-               first case, will remove the first member of that class found in the list of callbacks.
+            callback (`type` or [`~transformers.TrainerCallback`]):
+                A [`~transformers.TrainerCallback`] class or an instance of a [`~transformers.TrainerCallback`]. In the
+                first case, will remove the first member of this class found in the list of callbacks.
         """
-        self.st_trainer.remove_callback(callback)
+        if self.st_trainer is not None:
+            self.st_trainer.remove_callback(callback)
 
     def apply_hyperparameters(self, params: Dict[str, Any], final_model: bool = False) -> None:
         """Applies a dictionary of hyperparameters to both the trainer and the model
@@ -491,6 +521,8 @@ class Trainer(ColumnMappingMixin):
 
     def train(
         self,
+        x_train: Optional[List[str]] = None,
+        y_train: Optional[Union[List[int], List[List[int]]]] = None,
         args: Optional[TrainingArguments] = None,
         trial: Optional[Union["optuna.Trial", Dict[str, Any]]] = None,
         **kwargs,
@@ -499,6 +531,8 @@ class Trainer(ColumnMappingMixin):
         Main training entry point.
 
         Args:
+            x_train (`List[str]`, *optional*): List of image paths for training
+            y_train (`Union[List[int], List[List[int]]]`, *optional*): Training labels
             args (`TrainingArguments`, *optional*):
                 Temporarily change the training arguments for this training call.
             trial (`optuna.Trial` or `Dict[str, Any]`, *optional*):
@@ -518,15 +552,34 @@ class Trainer(ColumnMappingMixin):
 
         args = args or self.args or TrainingArguments()
 
-        if self.train_dataset is None:
+        # Handle case where training data is passed as parameters
+        if x_train is not None and y_train is not None:
+            # Create dataset from provided data
+            from datasets import Dataset
+            train_dataset = Dataset.from_dict({"image_path": x_train, "label": y_train})
+            train_parameters = [x_train, y_train]
+        elif self.train_dataset is None:
             raise ValueError(
-                f"Training requires a `train_dataset` given to the `{self.__class__.__name__}` initialization."
+                f"Training requires either a `train_dataset` given to the `{self.__class__.__name__}` initialization "
+                f"or `x_train` and `y_train` parameters passed to the `train` method."
+            )
+        else:
+            train_parameters = self.dataset_to_parameters(self.train_dataset)
+            full_parameters = (
+                train_parameters + self.dataset_to_parameters(self.eval_dataset) if self.eval_dataset else train_parameters
             )
 
-        train_parameters = self.dataset_to_parameters(self.train_dataset)
-        full_parameters = (
-            train_parameters + self.dataset_to_parameters(self.eval_dataset) if self.eval_dataset else train_parameters
-        )
+        if x_train is not None and y_train is not None:
+            # Use parameters directly
+            full_parameters = (
+                train_parameters + self.dataset_to_parameters(self.eval_dataset) if self.eval_dataset else train_parameters
+            )
+        else:
+            # Use dataset parameters
+            train_parameters = self.dataset_to_parameters(self.train_dataset)
+            full_parameters = (
+                train_parameters + self.dataset_to_parameters(self.eval_dataset) if self.eval_dataset else train_parameters
+            )
 
         self.train_embeddings(*full_parameters, args=args)
         self.train_classifier(*train_parameters, args=args)
@@ -552,7 +605,8 @@ class Trainer(ColumnMappingMixin):
                 Temporarily change the training arguments for this training call.
         """
         if args:
-            self.st_trainer.setfit_args = args
+            if self.st_trainer is not None:
+                self.st_trainer.setfit_args = args
         args = args or self.args or TrainingArguments()
 
         train_max_pairs = -1 if args.max_steps == -1 else args.max_steps * args.embedding_batch_size
@@ -568,18 +622,24 @@ class Trainer(ColumnMappingMixin):
         logger.info(f"  Batch size = {args.embedding_batch_size}")
         logger.info(f"  Num epochs = {args.embedding_num_epochs}")
 
-        self.st_trainer.train_dataset = train_dataset
-        self.st_trainer.eval_dataset = eval_dataset
-        self.st_trainer.loss = loss
-        if loss in (
-            losses.BatchAllTripletLoss,
-            losses.BatchHardTripletLoss,
-            losses.BatchSemiHardTripletLoss,
-            losses.BatchHardSoftMarginTripletLoss,
-            SupConLoss,
-        ):
-            self.st_trainer.args.batch_sampler = BatchSamplers.GROUP_BY_LABEL
-        self.st_trainer.train()
+        if self.st_trainer is not None:
+            # Original behavior for text models
+            self.st_trainer.train_dataset = train_dataset
+            self.st_trainer.eval_dataset = eval_dataset
+            self.st_trainer.loss = loss
+            if loss in (
+                losses.BatchAllTripletLoss,
+                losses.BatchHardTripletLoss,
+                losses.BatchSemiHardTripletLoss,
+                losses.BatchHardSoftMarginTripletLoss,
+                SupConLoss,
+            ):
+                self.st_trainer.args.batch_sampler = BatchSamplers.GROUP_BY_LABEL
+            self.st_trainer.train()
+        else:
+            # For image models, we skip the embedding training phase
+            # as TIMM models are already pretrained
+            logger.info("Skipping embedding training for image model (using pretrained TIMM features)")
 
     def get_dataset(
         self, x: List[str], y: Union[List[int], List[List[int]]], args: TrainingArguments, max_pairs: int = -1
@@ -626,7 +686,8 @@ class Trainer(ColumnMappingMixin):
         Args:
             logs_mapper (str): The logging prefix, e.g. "aspect_embedding".
         """
-        self.st_trainer._set_logs_prefix(logs_prefix)
+        if self.st_trainer is not None:
+            self.st_trainer._set_logs_prefix(logs_prefix)
 
     def train_classifier(
         self, x_train: List[str], y_train: Union[List[int], List[List[int]]], args: Optional[TrainingArguments] = None
@@ -835,6 +896,255 @@ class Trainer(ColumnMappingMixin):
             )
         commit_message = kwargs.pop("commit_message", "Add SetFit model")
         return self.model.push_to_hub(repo_id, commit_message=commit_message, **kwargs)
+
+
+class SetFitImageTrainer(Trainer):
+    """Trainer for image classification using SetFit with TIMM models.
+
+    This trainer extends the base Trainer class to work specifically with
+    image data and TIMM models for computer vision tasks.
+    """
+
+    def __init__(
+        self,
+        model: Optional["SetFitImageModel"] = None,
+        args: Optional[TrainingArguments] = None,
+        train_dataset: Optional[Union[Dataset, List[Tuple]]] = None,
+        eval_dataset: Optional[Union[Dataset, List[Tuple]]] = None,
+        model_init: Optional[Callable[[], "SetFitImageModel"]] = None,
+        metric: Union[str, Callable[["Dataset", "Dataset"], Dict[str, float]]] = "accuracy",
+        metric_kwargs: Optional[Dict[str, Any]] = None,
+        callbacks: Optional[List[TrainerCallback]] = None,
+        column_mapping: Optional[Dict[str, str]] = None,
+        image_transforms: Optional[Any] = None,
+        image_size: Tuple[int, int] = (224, 224),
+    ):
+        # Initialize label encoder
+        self.label_encoder = None
+        """Initialize SetFitImageTrainer.
+
+        Args:
+            model: SetFitImageModel to train
+            args: Training arguments
+            train_dataset: Training dataset (can be Dataset or list of (image_path, label) tuples)
+            eval_dataset: Evaluation dataset
+            model_init: Function to initialize model
+            metric: Metric to use for evaluation
+            metric_kwargs: Additional metric arguments
+            callbacks: Training callbacks
+            column_mapping: Column mapping for datasets
+            image_transforms: Custom image transformations
+            image_size: Target image size
+        """
+        # Handle different dataset formats
+        if train_dataset is not None and not isinstance(train_dataset, Dataset):
+            train_dataset = self._convert_image_list_to_dataset(train_dataset, image_transforms, image_size)
+
+        if eval_dataset is not None and not isinstance(eval_dataset, Dataset):
+            eval_dataset = self._convert_image_list_to_dataset(eval_dataset, image_transforms, image_size)
+
+        # Initialize parent class
+        super().__init__(
+            model=model,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            model_init=model_init,
+            metric=metric,
+            metric_kwargs=metric_kwargs,
+            callbacks=callbacks,
+            column_mapping=column_mapping,
+        )
+
+        # Store image-specific parameters
+        self.image_transforms = image_transforms
+        self.image_size = image_size
+
+    def _convert_image_list_to_dataset(
+        self,
+        dataset: List[Tuple],
+        image_transforms: Optional[Any],
+        image_size: Tuple[int, int],
+    ) -> Dataset:
+        """Convert list of (image_path, label) tuples to HuggingFace Dataset.
+
+        Args:
+            dataset: List of (image_path, label) tuples
+            image_transforms: Image transformations to use
+            image_size: Target image size
+
+        Returns:
+            HuggingFace Dataset
+        """
+        if not dataset:
+            raise ValueError("Dataset cannot be empty")
+
+        image_paths = []
+        labels = []
+
+        for item in dataset:
+            if len(item) == 2:
+                image_path, label = item
+                image_paths.append(str(image_path))
+                labels.append(label)
+            else:
+                raise ValueError(f"Expected (image_path, label) tuple, got {item}")
+
+        # Create HuggingFace dataset
+        hf_dataset = Dataset.from_dict({
+            "image_path": image_paths,
+            "label": labels,
+        })
+
+        return hf_dataset
+
+    def dataset_to_parameters(self, dataset: Dataset) -> List[List]:
+        """Convert dataset to training parameters for image model.
+
+        Args:
+            dataset: HuggingFace Dataset
+
+        Returns:
+            List of [image_paths, labels]
+        """
+        # Handle different column names
+        if "image_path" in dataset.column_names:
+            image_paths = dataset["image_path"]
+        elif "image" in dataset.column_names:
+            image_paths = dataset["image"]
+        else:
+            # Assume first column contains image paths
+            image_paths = dataset[dataset.column_names[0]]
+
+        labels = dataset["label"]
+
+        return [image_paths, labels]
+
+    def train_embeddings(
+        self,
+        x_train: List[str],
+        y_train: Optional[Union[List[int], List[List[int]]]] = None,
+        x_eval: Optional[List[str]] = None,
+        y_eval: Optional[Union[List[int], List[List[int]]]] = None,
+        args: Optional[TrainingArguments] = None,
+    ) -> None:
+        """Train image embeddings using contrastive learning.
+
+        Args:
+            x_train: List of image paths for training
+            y_train: Training labels
+            x_eval: List of image paths for evaluation
+            y_eval: Evaluation labels
+            args: Training arguments
+        """
+        # For image models, skip embedding training as TIMM models are pretrained
+        logger.info("Skipping embedding training for image model (using pretrained TIMM features)")
+
+    def train_classifier(
+        self,
+        x_train: List[str],
+        y_train: Union[List[int], List[List[int]]],
+        args: Optional[TrainingArguments] = None,
+    ) -> None:
+        """Train the image classifier head.
+
+        Args:
+            x_train: List of image paths for training
+            y_train: Training labels
+            args: Training arguments
+        """
+        args = args or self.args or TrainingArguments()
+
+        # Encode string labels to integers if necessary
+        if y_train and isinstance(y_train[0], str):
+            from sklearn.preprocessing import LabelEncoder
+            if self.label_encoder is None:
+                self.label_encoder = LabelEncoder()
+                y_train_encoded = self.label_encoder.fit_transform(y_train).tolist()
+                # Set labels in the model for prediction
+                self.model.labels = self.label_encoder.classes_.tolist()
+            else:
+                y_train_encoded = self.label_encoder.transform(y_train).tolist()
+        else:
+            y_train_encoded = y_train
+
+        # Use the image model's fit method
+        self.model.fit(
+            x_train,
+            y_train_encoded,
+            num_epochs=args.classifier_num_epochs,
+            batch_size=args.classifier_batch_size,
+            body_learning_rate=args.body_classifier_learning_rate,
+            head_learning_rate=args.head_learning_rate,
+            l2_weight=args.l2_weight,
+            show_progress_bar=args.show_progress_bar,
+            end_to_end=args.end_to_end,
+        )
+
+    @torch.no_grad()
+    def evaluate(self, dataset: Optional[Dataset] = None, metric_key_prefix: str = "test") -> Dict[str, float]:
+        """Evaluate the image model.
+
+        Args:
+            dataset: Dataset to evaluate on
+            metric_key_prefix: Prefix for metric keys
+
+        Returns:
+            Evaluation metrics
+        """
+        if dataset is not None:
+            self._validate_column_mapping(dataset)
+            if self.column_mapping is not None:
+                logger.info("Applying column mapping to the evaluation dataset")
+                eval_dataset = self._apply_column_mapping(dataset, self.column_mapping)
+            else:
+                eval_dataset = dataset
+        else:
+            eval_dataset = self.eval_dataset
+
+        if eval_dataset is None:
+            raise ValueError("No evaluation dataset provided to `SetFitImageTrainer.evaluate` nor the `SetFitImageTrainer` initialization.")
+
+        # Get image paths and labels
+        if "image_path" in eval_dataset.column_names:
+            x_test = eval_dataset["image_path"]
+        else:
+            x_test = eval_dataset[eval_dataset.column_names[0]]
+
+        y_test = eval_dataset["label"]
+
+        logger.info("***** Running image evaluation *****")
+        y_pred = self.model.predict(x_test, use_labels=False)
+
+        if isinstance(y_pred, torch.Tensor):
+            y_pred = y_pred.cpu()
+
+        # Normalize string outputs
+        if y_test and isinstance(y_test[0], str):
+            encoder = LabelEncoder()
+            encoder.fit(list(y_test) + list(y_pred))
+            y_test = encoder.transform(y_test)
+            y_pred = encoder.transform(y_pred)
+
+        metric_kwargs = self.metric_kwargs or {}
+        if isinstance(self.metric, str):
+            metric_config = "multilabel" if self.model.multi_target_strategy is not None else None
+            metric_fn = evaluate.load(self.metric, config_name=metric_config)
+
+            results = metric_fn.compute(predictions=y_pred, references=y_test, **metric_kwargs)
+
+        elif callable(self.metric):
+            results = self.metric(y_pred, y_test, **metric_kwargs)
+
+        else:
+            raise ValueError("metric must be a string or a callable")
+
+        if not isinstance(results, dict):
+            results = {"metric": results}
+        self.model.model_card_data.post_training_eval_results(
+            {f"{metric_key_prefix}_{key}": value for key, value in results.items()}
+        )
+        return results
 
 
 class SetFitTrainer(Trainer):

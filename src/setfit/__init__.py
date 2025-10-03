@@ -4,11 +4,11 @@ import importlib
 import os
 import warnings
 
-from .data import get_templated_dataset, sample_dataset
+from .data import get_templated_dataset, sample_dataset, SetFitImageDataset
 from .model_card import SetFitModelCardData
-from .modeling import SetFitHead, SetFitModel
+from .modeling import SetFitHead, SetFitModel, SetFitImageEncoder, SetFitImageModel
 from .span import AbsaModel, AbsaTrainer, AspectExtractor, AspectModel, PolarityModel
-from .trainer import SetFitTrainer, Trainer
+from .trainer import SetFitTrainer, Trainer, SetFitImageTrainer
 from .trainer_distillation import DistillationSetFitTrainer, DistillationTrainer
 from .training_args import TrainingArguments
 
