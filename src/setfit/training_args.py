@@ -222,6 +222,9 @@ class TrainingArguments:
     metric_for_best_model: Optional[str] = field(default="embedding_loss", repr=False)
     greater_is_better: bool = field(default=False, repr=False)
 
+    # Image-specific arguments
+    use_image_pairs: bool = False
+
     def __post_init__(self) -> None:
         # Set `self.embedding_batch_size` and `self.classifier_batch_size` using values from `self.batch_size`
         if isinstance(self.batch_size, int):

@@ -369,6 +369,99 @@ class SetFitImageDataset(TorchDataset):
         return images, labels
 
 
+class SetFitImagePairDataset(TorchDataset):
+    """SetFitImagePairDataset
+
+    A dataset for training image embeddings using contrastive learning with explicit pairs.
+
+    Args:
+        pairs (`List[Dict[str, Union[str, float]]]`):
+            List of pair dictionaries with keys 'image_1', 'image_2', 'label'
+        transform (`transforms.Compose`, *optional*):
+            The image transformation pipeline to apply. If None, uses default transforms.
+        image_size (`Tuple[int, int]`, defaults to `(224, 224)`):
+            The target size for images (height, width).
+        model_name (`str`, *optional*):
+            TIMM model name for getting appropriate transforms. Required if transform is None.
+    """
+
+    def __init__(
+        self,
+        pairs: List[Dict[str, Union[str, float]]],
+        transform: Optional[transforms.Compose] = None,
+        image_size: Tuple[int, int] = (224, 224),
+        model_name: Optional[str] = None,
+    ) -> None:
+        self.pairs = pairs
+        self.image_size = image_size
+
+        # Create default transform if not provided
+        if transform is None:
+            if model_name is None:
+                raise ValueError("model_name must be provided if transform is None")
+            transform = get_image_transforms(
+                model_name=model_name,
+                is_training=True,
+            )
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """Get a pair of images and their similarity label.
+
+        Args:
+            idx: Index of the pair
+
+        Returns:
+            Tuple of (image1_tensor, image2_tensor, label)
+        """
+        pair = self.pairs[idx]
+        image1_path = pair["image_1"]
+        image2_path = pair["image_2"]
+        label = pair["label"]
+
+        # Load and transform both images
+        try:
+            image1 = load_image(image1_path)
+            image1_tensor = self.transform(image1)
+
+            image2 = load_image(image2_path)
+            image2_tensor = self.transform(image2)
+        except Exception as e:
+            raise ValueError(f"Error loading images {image1_path}, {image2_path}: {e}")
+
+        return image1_tensor, image2_tensor, label
+
+    def collate_fn(self, batch):
+        """Collate function for DataLoader.
+
+        Args:
+            batch: List of (image1_tensor, image2_tensor, label) tuples
+
+        Returns:
+            Tuple of (batched_image1, batched_image2, batched_labels)
+        """
+        image1s = []
+        image2s = []
+        labels = []
+
+        for image1_tensor, image2_tensor, label in batch:
+            image1s.append(image1_tensor)
+            image2s.append(image2_tensor)
+            labels.append(label)
+
+        # Stack images into batches
+        image1s = torch.stack(image1s, dim=0)
+        image2s = torch.stack(image2s, dim=0)
+
+        # Convert labels to tensor
+        labels = torch.tensor(labels, dtype=torch.float)
+
+        return image1s, image2s, labels
+
+
 def load_image_dataset(
     dataset_path: Union[str, Path],
     extensions: Tuple[str, ...] = (".jpg", ".jpeg", ".png", ".bmp", ".tiff"),

@@ -24,7 +24,7 @@ from setfit.model_card import ModelCardCallback
 from . import logging
 from .integrations import default_hp_search_backend, is_optuna_available, run_hp_search_optuna
 from .losses import SupConLoss
-from .sampler import ContrastiveDataset
+from .sampler import ContrastiveDataset, ImageContrastiveDataset
 from .training_args import TrainingArguments
 from .utils import BestRun, default_hp_space_optuna
 from .data import SetFitImageDataset
@@ -620,7 +620,9 @@ class Trainer(ColumnMappingMixin):
             if hasattr(self.model, 'train_embeddings') and getattr(self.model, 'train_embeddings', False):
                 # Train the TIMM model embeddings
                 logger.info("Training TIMM model embeddings for image model")
-                self._train_image_embeddings(x_train, y_train, x_eval, y_eval, args)
+                # Check if we should use pair-based training (default to False for backward compatibility)
+                use_pairs = getattr(args, 'use_image_pairs', False)
+                self._train_image_embeddings(x_train, y_train, x_eval, y_eval, args, use_pairs=use_pairs)
             else:
                 # Skip embedding training as TIMM models are already pretrained
                 logger.info("Skipping embedding training for image model (using pretrained TIMM features)")
@@ -699,6 +701,7 @@ class Trainer(ColumnMappingMixin):
         x_eval: Optional[List[str]] = None,
         y_eval: Optional[Union[List[int], List[List[int]]]] = None,
         args: Optional[TrainingArguments] = None,
+        use_pairs: bool = False,
     ) -> None:
         """Train TIMM model embeddings using contrastive learning.
 
@@ -708,6 +711,7 @@ class Trainer(ColumnMappingMixin):
             x_eval: List of image paths for evaluation
             y_eval: Evaluation labels
             args: Training arguments
+            use_pairs: Whether to use explicit image pairs (like text) or batch-based approach
         """
         args = args or self.args or TrainingArguments()
 
@@ -738,17 +742,42 @@ class Trainer(ColumnMappingMixin):
         else:
             y_eval_encoded = y_eval
 
-        # Create image dataset for contrastive learning
-        from .data import SetFitImageDataset
-        train_dataset = SetFitImageDataset(
-            x_train,
-            y_train_encoded,
-            model_name=self.model.timm_model_name,
-            image_size=self.model.image_size,
-        )
+        if use_pairs:
+            # Use pair-based approach similar to text
+            logger.info("Using pair-based contrastive learning for image embeddings")
+            from .data import SetFitImagePairDataset
 
-        # Use supervised contrastive loss for image embeddings
-        loss = SupConLoss(self.model.model_body)
+            # Generate image pairs
+            pair_dataset = ImageContrastiveDataset(
+                x_train,
+                y_train_encoded,
+                multilabel=self.model.multi_target_strategy is not None,
+                num_iterations=args.num_iterations,
+                sampling_strategy=args.sampling_strategy,
+            )
+
+            # Create dataset for loading image pairs
+            train_dataset = SetFitImagePairDataset(
+                list(pair_dataset),
+                model_name=self.model.timm_model_name,
+                image_size=self.model.image_size,
+            )
+
+            # Use supervised contrastive loss for image pairs
+            loss = SupConLoss(self.model.model_body)
+        else:
+            # Use batch-based approach (current default)
+            logger.info("Using batch-based contrastive learning for image embeddings")
+            from .data import SetFitImageDataset
+            train_dataset = SetFitImageDataset(
+                x_train,
+                y_train_encoded,
+                model_name=self.model.timm_model_name,
+                image_size=self.model.image_size,
+            )
+
+            # Use supervised contrastive loss for image embeddings
+            loss = SupConLoss(self.model.model_body)
 
         # Set up optimizer for image model body
         # Only optimize parameters that require gradients
@@ -783,32 +812,59 @@ class Trainer(ColumnMappingMixin):
             )
 
             for batch in tqdm(dataloader, desc="Iteration", disable=not args.show_progress_bar, leave=False):
-                images, labels = batch
+                if use_pairs:
+                    # Pair-based approach
+                    image1s, image2s, labels = batch
 
-                # Move to device
-                images = images.to(self.model.device)
-                labels = labels.to(self.model.device)
-                
-                # Skip empty batches
-                if len(images) == 0 or len(labels) == 0:
-                    continue
+                    # Move to device
+                    image1s = image1s.to(self.model.device)
+                    image2s = image2s.to(self.model.device)
+                    labels = labels.to(self.model.device)
 
-                optimizer.zero_grad()
+                    # Skip empty batches
+                    if len(image1s) == 0 or len(image2s) == 0 or len(labels) == 0:
+                        continue
 
-                # Forward pass
-                embeddings = self.model.model_body.encode(images, convert_to_tensor=True, normalize_embeddings=self.model.normalize_embeddings)
+                    optimizer.zero_grad()
 
-                # Compute loss
-                # For image models, embeddings are already computed, so use compute_loss_from_embeddings directly
-                embeddings_list = [embeddings[i] for i in range(embeddings.size(0))]
-                batch_loss = loss.compute_loss_from_embeddings(embeddings_list, labels)
-                
+                    # Forward pass - encode both images in pair
+                    embeddings1 = self.model.model_body.encode(image1s, convert_to_tensor=True, normalize_embeddings=self.model.normalize_embeddings)
+                    embeddings2 = self.model.model_body.encode(image2s, convert_to_tensor=True, normalize_embeddings=self.model.normalize_embeddings)
+
+                    # Stack embeddings for contrastive loss
+                    # Shape: [batch_size, 2, emb_dim]
+                    paired_embeddings = torch.stack([embeddings1, embeddings2], dim=1)
+
+                    # Compute loss using forward method (expects [bsz, n_views, ...])
+                    batch_loss = loss(paired_embeddings, labels)
+                else:
+                    # Batch-based approach
+                    images, labels = batch
+
+                    # Move to device
+                    images = images.to(self.model.device)
+                    labels = labels.to(self.model.device)
+
+                    # Skip empty batches
+                    if len(images) == 0 or len(labels) == 0:
+                        continue
+
+                    optimizer.zero_grad()
+
+                    # Forward pass
+                    embeddings = self.model.model_body.encode(images, convert_to_tensor=True, normalize_embeddings=self.model.normalize_embeddings)
+
+                    # Compute loss
+                    # For image models, embeddings are already computed, so use compute_loss_from_embeddings directly
+                    embeddings_list = [embeddings[i] for i in range(embeddings.size(0))]
+                    batch_loss = loss.compute_loss_from_embeddings(embeddings_list, labels)
+
                 # Check for NaN loss and log a warning
                 if torch.isnan(batch_loss).any() or torch.isinf(batch_loss).any():
                     logger.warning(f"NaN or Inf loss detected: {batch_loss.item()}. This may be due to batch composition. Consider increasing batch size or checking label distribution in batch.")
                     # Skip this batch if loss is invalid
                     continue
-                
+
                 batch_loss.backward()
                 optimizer.step()
 

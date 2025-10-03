@@ -147,6 +147,124 @@ class ContrastiveDataset(IterableDataset):
         return self.len_pos_pairs + self.len_neg_pairs
 
 
+class ImageContrastiveDataset(ContrastiveDataset):
+    def __init__(
+        self,
+        image_paths: List[str],
+        labels: List[Union[int, float]],
+        multilabel: bool,
+        num_iterations: Optional[None] = None,
+        sampling_strategy: str = "oversampling",
+        max_pairs: int = -1,
+    ) -> None:
+        """Generates positive and negative image pairs for contrastive learning.
+
+        Args:
+            image_paths (List[str]): image paths to generate pairs from
+            labels (List[Union[int, float]]): labels for each image
+            multilabel: set to process "multilabel" labels array
+            sampling_strategy: "unique", "oversampling", or "undersampling"
+            num_iterations: if provided explicitly sets the number of pairs to be generated
+                where n_pairs = n_iterations * n_images * 2 (for pos & neg pairs)
+            max_pairs: If not -1, then we only sample pairs until we have certainly reached
+                max_pairs pairs.
+        """
+        # Initialize with image paths instead of sentences
+        self.image_paths = image_paths
+        self.labels = labels
+        self.image_labels = list(zip(self.image_paths, self.labels))
+
+        # Initialize parent class attributes
+        self.pos_index = 0
+        self.neg_index = 0
+        self.pos_pairs = []
+        self.neg_pairs = []
+        self.max_pos_or_neg = -1 if max_pairs == -1 else max_pairs // 2
+
+        if multilabel:
+            self.generate_multilabel_pairs()
+        else:
+            self.generate_pairs()
+
+        if num_iterations is not None and num_iterations > 0:
+            self.len_pos_pairs = num_iterations * len(self.image_paths)
+            self.len_neg_pairs = num_iterations * len(self.image_paths)
+
+        elif sampling_strategy == "unique":
+            self.len_pos_pairs = len(self.pos_pairs)
+            self.len_neg_pairs = len(self.neg_pairs)
+
+        elif sampling_strategy == "undersampling":
+            self.len_pos_pairs = min(len(self.pos_pairs), len(self.neg_pairs))
+            self.len_neg_pairs = min(len(self.pos_pairs), len(self.neg_pairs))
+
+        elif sampling_strategy == "oversampling":
+            self.len_pos_pairs = max(len(self.pos_pairs), len(self.neg_pairs))
+            self.len_neg_pairs = max(len(self.pos_pairs), len(self.neg_pairs))
+
+        else:
+            raise ValueError("Invalid sampling strategy. Must be one of 'unique', 'oversampling', or 'undersampling'.")
+
+    def generate_pairs(self) -> None:
+        for (_image, _label), (image, label) in shuffle_combinations(self.image_labels):
+            is_positive = _label == label
+            is_positive_full = self.max_pos_or_neg != -1 and len(self.pos_pairs) >= self.max_pos_or_neg
+            is_negative_full = self.max_pos_or_neg != -1 and len(self.neg_pairs) >= self.max_pos_or_neg
+
+            if is_positive:
+                if not is_positive_full:
+                    self.pos_pairs.append({"image_1": _image, "image_2": image, "label": 1.0})
+            elif not is_negative_full:
+                self.neg_pairs.append({"image_1": _image, "image_2": image, "label": 0.0})
+
+            if is_positive_full and is_negative_full:
+                break
+
+    def generate_multilabel_pairs(self) -> None:
+        for (_image, _label), (image, label) in shuffle_combinations(self.image_labels):
+            # logical_and checks if labels are both set for each class
+            is_positive = any(np.logical_and(_label, label))
+            is_positive_full = self.max_pos_or_neg != -1 and len(self.pos_pairs) >= self.max_pos_or_neg
+            is_negative_full = self.max_pos_or_neg != -1 and len(self.neg_pairs) >= self.max_pos_or_neg
+
+            if is_positive:
+                if not is_positive_full:
+                    self.pos_pairs.append({"image_1": _image, "image_2": image, "label": 1.0})
+            elif not is_negative_full:
+                self.neg_pairs.append({"image_1": _image, "image_2": image, "label": 0.0})
+
+            if is_positive_full and is_negative_full:
+                break
+
+    def get_positive_pairs(self) -> List[Dict[str, Union[str, float]]]:
+        pairs = []
+        for _ in range(self.len_pos_pairs):
+            if self.pos_index >= len(self.pos_pairs):
+                self.pos_index = 0
+            pairs.append(self.pos_pairs[self.pos_index])
+            self.pos_index += 1
+        return pairs
+
+    def get_negative_pairs(self) -> List[Dict[str, Union[str, float]]]:
+        pairs = []
+        for _ in range(self.len_neg_pairs):
+            if self.neg_index >= len(self.neg_pairs):
+                self.neg_index = 0
+            pairs.append(self.neg_pairs[self.neg_index])
+            self.neg_index += 1
+        return pairs
+
+    def __iter__(self):
+        for pos_pair, neg_pair in zip_longest(self.get_positive_pairs(), self.get_negative_pairs()):
+            if pos_pair is not None:
+                yield pos_pair
+            if neg_pair is not None:
+                yield neg_pair
+
+    def __len__(self) -> int:
+        return self.len_pos_pairs + self.len_neg_pairs
+
+
 class ContrastiveDistillationDataset(ContrastiveDataset):
     def __init__(
         self,
