@@ -168,6 +168,7 @@ class TimmModelWrapper:
         image_size: Tuple[int, int] = (224, 224),
         num_classes: int = 0,  # Ignored for feature extraction
         device: Optional[Union[str, torch.device]] = None,
+        train_embeddings: bool = False,
     ):
         """Initialize TIMM model wrapper.
 
@@ -177,10 +178,12 @@ class TimmModelWrapper:
             image_size: Input image size for the model
             num_classes: Ignored for feature extraction
             device: Device to load model on
+            train_embeddings: Whether to train the model embeddings (if False, model will be frozen)
         """
         self.model_name = model_name
         self.image_size = image_size
         self.num_classes = num_classes
+        self.train_embeddings = train_embeddings
 
         # Determine device
         if device is None:
@@ -194,7 +197,14 @@ class TimmModelWrapper:
         )
 
         self.model = self.model.to(self.device)
-        self.model.eval()
+
+        # Freeze model if not training embeddings
+        if not train_embeddings:
+            self.model.eval()
+            for param in self.model.parameters():
+                param.requires_grad = False
+        else:
+            self.model.train()
 
         # Get feature dimension
         with torch.no_grad():
@@ -214,9 +224,17 @@ class TimmModelWrapper:
         """
         images = images.to(self.device)
 
-        with torch.no_grad():
+        # Use gradients only during training when train_embeddings=True
+        # Use no_grad during inference to save memory
+        if self.train_embeddings and self.model.training:
+            # Training mode with trainable embeddings - allow gradients
             features = self.model.forward_features(images)
             features = self.model.forward_head(features, pre_logits=True)
+        else:
+            # Inference mode or frozen embeddings - use no_grad for memory efficiency
+            with torch.no_grad():
+                features = self.model.forward_features(images)
+                features = self.model.forward_head(features, pre_logits=True)
 
         return features
 
@@ -236,7 +254,8 @@ class TimmModelWrapper:
 
     def train(self):
         """Set model to training mode."""
-        self.model.train()
+        if self.train_embeddings:
+            self.model.train()
 
     def eval(self):
         """Set model to evaluation mode."""

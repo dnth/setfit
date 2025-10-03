@@ -11,6 +11,8 @@ from sentence_transformers.model_card import ModelCardCallback as STModelCardCal
 from sentence_transformers.training_args import BatchSamplers, SentenceTransformerTrainingArguments
 from sklearn.preprocessing import LabelEncoder
 from torch import nn
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm, trange
 from transformers import __version__ as transformers_version
 from transformers.integrations import CodeCarbonCallback
 from transformers.trainer_callback import IntervalStrategy, TrainerCallback
@@ -336,6 +338,9 @@ class Trainer(ColumnMappingMixin):
         self.metric_kwargs = metric_kwargs
         self.logs_mapper = {}
 
+        # Initialize label encoder for handling string labels
+        self.label_encoder = None
+
         # Seed must be set before instantiating the model when using model_init.
         set_seed(args.seed if args is not None else 12)
 
@@ -607,37 +612,46 @@ class Trainer(ColumnMappingMixin):
                 self.st_trainer.setfit_args = args
         args = args or self.args or TrainingArguments()
 
-        train_max_pairs = -1 if args.max_steps == -1 else args.max_steps * args.embedding_batch_size
-        train_dataset, loss = self.get_dataset(x_train, y_train, args=args, max_pairs=train_max_pairs)
-        if x_eval is not None and args.eval_strategy != IntervalStrategy.NO:
-            eval_max_pairs = -1 if args.eval_max_steps == -1 else args.eval_max_steps * args.embedding_batch_size
-            eval_dataset, _ = self.get_dataset(x_eval, y_eval, args=args, max_pairs=eval_max_pairs)
+        # Check if this is an image model
+        is_image_model = hasattr(self.model, 'timm_model_name')
+
+        if is_image_model:
+            # For image models, check if we should train embeddings
+            if hasattr(self.model, 'train_embeddings') and getattr(self.model, 'train_embeddings', False):
+                # Train the TIMM model embeddings
+                logger.info("Training TIMM model embeddings for image model")
+                self._train_image_embeddings(x_train, y_train, x_eval, y_eval, args)
+            else:
+                # Skip embedding training as TIMM models are already pretrained
+                logger.info("Skipping embedding training for image model (using pretrained TIMM features)")
         else:
-            eval_dataset = None
-
-        logger.info("***** Running training *****")
-        logger.info(f"  Num unique pairs = {len(train_dataset)}")
-        logger.info(f"  Batch size = {args.embedding_batch_size}")
-        logger.info(f"  Num epochs = {args.embedding_num_epochs}")
-
-        if self.st_trainer is not None:
             # Original behavior for text models
-            self.st_trainer.train_dataset = train_dataset
-            self.st_trainer.eval_dataset = eval_dataset
-            self.st_trainer.loss = loss
-            if loss in (
-                losses.BatchAllTripletLoss,
-                losses.BatchHardTripletLoss,
-                losses.BatchSemiHardTripletLoss,
-                losses.BatchHardSoftMarginTripletLoss,
-                SupConLoss,
-            ):
-                self.st_trainer.args.batch_sampler = BatchSamplers.GROUP_BY_LABEL
-            self.st_trainer.train()
-        else:
-            # For image models, we skip the embedding training phase
-            # as TIMM models are already pretrained
-            logger.info("Skipping embedding training for image model (using pretrained TIMM features)")
+            train_max_pairs = -1 if args.max_steps == -1 else args.max_steps * args.embedding_batch_size
+            train_dataset, loss = self.get_dataset(x_train, y_train, args=args, max_pairs=train_max_pairs)
+            if x_eval is not None and args.eval_strategy != IntervalStrategy.NO:
+                eval_max_pairs = -1 if args.eval_max_steps == -1 else args.eval_max_steps * args.embedding_batch_size
+                eval_dataset, _ = self.get_dataset(x_eval, y_eval, args=args, max_pairs=eval_max_pairs)
+            else:
+                eval_dataset = None
+
+            logger.info("***** Running training *****")
+            logger.info(f"  Num unique pairs = {len(train_dataset)}")
+            logger.info(f"  Batch size = {args.embedding_batch_size}")
+            logger.info(f"  Num epochs = {args.embedding_num_epochs}")
+
+            if self.st_trainer is not None:
+                self.st_trainer.train_dataset = train_dataset
+                self.st_trainer.eval_dataset = eval_dataset
+                self.st_trainer.loss = loss
+                if loss in (
+                    losses.BatchAllTripletLoss,
+                    losses.BatchHardTripletLoss,
+                    losses.BatchSemiHardTripletLoss,
+                    losses.BatchHardSoftMarginTripletLoss,
+                    SupConLoss,
+                ):
+                    self.st_trainer.args.batch_sampler = BatchSamplers.GROUP_BY_LABEL
+                self.st_trainer.train()
 
     def get_dataset(
         self, x: List[str], y: Union[List[int], List[List[int]]], args: TrainingArguments, max_pairs: int = -1
@@ -678,6 +692,121 @@ class Trainer(ColumnMappingMixin):
 
         return dataset, loss
 
+    def _train_image_embeddings(
+        self,
+        x_train: List[str],
+        y_train: Optional[Union[List[int], List[List[int]]]] = None,
+        x_eval: Optional[List[str]] = None,
+        y_eval: Optional[Union[List[int], List[List[int]]]] = None,
+        args: Optional[TrainingArguments] = None,
+    ) -> None:
+        """Train TIMM model embeddings using contrastive learning.
+
+        Args:
+            x_train: List of image paths for training
+            y_train: Training labels
+            x_eval: List of image paths for evaluation
+            y_eval: Evaluation labels
+            args: Training arguments
+        """
+        args = args or self.args or TrainingArguments()
+
+        # Encode string labels to integers if necessary
+        if y_train and isinstance(y_train[0], str):
+            from sklearn.preprocessing import LabelEncoder
+            if self.label_encoder is None:
+                self.label_encoder = LabelEncoder()
+                y_train_encoded = self.label_encoder.fit_transform(y_train).tolist()
+                # Set labels in the model for prediction
+                if hasattr(self.model, 'labels'):
+                    self.model.labels = self.label_encoder.classes_.tolist()
+            else:
+                y_train_encoded = self.label_encoder.transform(y_train).tolist()
+        else:
+            y_train_encoded = y_train
+
+        if y_eval and isinstance(y_eval[0], str):
+            if self.label_encoder is None:
+                # If no encoder yet, fit on eval labels (shouldn't happen normally)
+                from sklearn.preprocessing import LabelEncoder
+                self.label_encoder = LabelEncoder()
+                y_eval_encoded = self.label_encoder.fit_transform(y_eval).tolist()
+                if hasattr(self.model, 'labels'):
+                    self.model.labels = self.label_encoder.classes_.tolist()
+            else:
+                y_eval_encoded = self.label_encoder.transform(y_eval).tolist()
+        else:
+            y_eval_encoded = y_eval
+
+        # Create image dataset for contrastive learning
+        from .data import SetFitImageDataset
+        train_dataset = SetFitImageDataset(
+            x_train,
+            y_train_encoded,
+            model_name=self.model.timm_model_name,
+            image_size=self.model.image_size,
+        )
+
+        # Use supervised contrastive loss for image embeddings
+        loss = SupConLoss(self.model.model_body)
+
+        # Set up optimizer for image model body
+        optimizer = torch.optim.AdamW(
+            self.model.model_body.parameters(),
+            lr=args.body_embedding_learning_rate,
+            weight_decay=args.l2_weight,
+        )
+
+        # Set up scheduler
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+
+        # Training loop
+        self.model.model_body.train()
+        for epoch in trange(args.embedding_num_epochs, desc="Epoch", disable=not args.show_progress_bar):
+            epoch_loss = 0.0
+            num_batches = 0
+
+            # Create data loader
+            dataloader = DataLoader(
+                train_dataset,
+                batch_size=args.embedding_batch_size,
+                shuffle=True,
+                collate_fn=train_dataset.collate_fn,
+                pin_memory=True,
+            )
+
+            for batch in tqdm(dataloader, desc="Iteration", disable=not args.show_progress_bar, leave=False):
+                images, labels = batch
+
+                # Move to device
+                images = images.to(self.model.device)
+                labels = labels.to(self.model.device)
+
+                optimizer.zero_grad()
+
+                # Forward pass
+                embeddings = self.model.model_body.encode(images, convert_to_tensor=True, normalize_embeddings=self.model.normalize_embeddings)
+
+                # Compute loss
+                # For image models, embeddings are already computed, so use compute_loss_from_embeddings directly
+                embeddings_list = [embeddings[i] for i in range(embeddings.size(0))]
+                batch_loss = loss.compute_loss_from_embeddings(embeddings_list, labels)
+                batch_loss.backward()
+                optimizer.step()
+
+                epoch_loss += batch_loss.item()
+                num_batches += 1
+
+            # Step scheduler
+            scheduler.step()
+
+            # Log epoch loss
+            avg_epoch_loss = epoch_loss / num_batches
+            logger.info(f"Epoch {epoch + 1}/{args.embedding_num_epochs}, Loss: {avg_epoch_loss:.4f}")
+
+        # Set model back to eval mode
+        self.model.model_body.eval()
+
     def _set_logs_prefix(self, logs_prefix: str) -> None:
         """Set the logging prefix.
 
@@ -701,6 +830,7 @@ class Trainer(ColumnMappingMixin):
         """
         args = args or self.args or TrainingArguments()
 
+        logger.info("Training classifier")
         self.model.fit(
             x_train,
             y_train,
@@ -1035,8 +1165,14 @@ class SetFitImageTrainer(Trainer):
             y_eval: Evaluation labels
             args: Training arguments
         """
-        # For image models, skip embedding training as TIMM models are pretrained
-        logger.info("Skipping embedding training for image model (using pretrained TIMM features)")
+        # For image models, check if we should train embeddings
+        if hasattr(self.model, 'train_embeddings') and getattr(self.model, 'train_embeddings', False):
+            # Train the TIMM model embeddings
+            logger.info("Training TIMM model embeddings for image model")
+            self._train_image_embeddings(x_train, y_train, x_eval, y_eval, args)
+        else:
+            # Skip embedding training as TIMM models are already pretrained
+            logger.info("Skipping embedding training for image model (using pretrained TIMM features)")
 
     def train_classifier(
         self,

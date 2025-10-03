@@ -203,6 +203,7 @@ class SetFitImageEncoder:
         pretrained: bool = True,
         image_size: Tuple[int, int] = (224, 224),
         device: Optional[Union[str, torch.device]] = None,
+        train_embeddings: bool = False,
     ):
         """Initialize the TIMM image encoder.
 
@@ -211,9 +212,11 @@ class SetFitImageEncoder:
             pretrained: Whether to use pretrained weights
             image_size: Input image size (height, width)
             device: Device to load the model on
+            train_embeddings: Whether to train the TIMM model embeddings
         """
         self.model_name = model_name
         self.image_size = image_size
+        self.train_embeddings = train_embeddings
 
         # Initialize TIMM model wrapper
         self.timm_model = TimmModelWrapper(
@@ -221,6 +224,7 @@ class SetFitImageEncoder:
             pretrained=pretrained,
             image_size=image_size,
             device=device,
+            train_embeddings=train_embeddings,
         )
 
         # Create default transform
@@ -312,37 +316,37 @@ class SetFitImageEncoder:
         if convert_to_tensor:
             return embeddings
         else:
-            return embeddings.cpu().numpy()
+            return embeddings.detach().cpu().numpy()
 
-    def get_sentence_embedding_dimension(self) -> int:
+    def get_embedding_dimension(self) -> int:
         """Get the dimension of the image embeddings."""
         return self.timm_model.get_feature_dim()
 
-    def get_max_seq_length(self) -> int:
-        """Get maximum sequence length (not applicable for images, returns image size)."""
-        return self.image_size[0] * self.image_size[1]
+    # def get_max_seq_length(self) -> int:
+    #     """Get maximum sequence length (not applicable for images, returns image size)."""
+    #     return self.image_size[0] * self.image_size[1]
 
-    def save(self, path: Union[str, Path], create_model_card: bool = True):
-        """Save the image encoder to disk.
+    # def save(self, path: Union[str, Path], create_model_card: bool = True):
+    #     """Save the image encoder to disk.
 
-        Args:
-            path: Directory to save to
-            create_model_card: Whether to create model card
-        """
-        path = Path(path)
-        path.mkdir(exist_ok=True, parents=True)
+    #     Args:
+    #         path: Directory to save to
+    #         create_model_card: Whether to create model card
+    #     """
+    #     path = Path(path)
+    #     path.mkdir(exist_ok=True, parents=True)
 
-        # Save model configuration
-        config = {
-            "model_name": self.model_name,
-            "image_size": self.image_size,
-        }
+    #     # Save model configuration
+    #     config = {
+    #         "model_name": self.model_name,
+    #         "image_size": self.image_size,
+    #     }
 
-        with open(path / "image_encoder_config.json", "w") as f:
-            json.dump(config, f)
+    #     with open(path / "image_encoder_config.json", "w") as f:
+    #         json.dump(config, f)
 
-        # Note: TIMM models would need to be saved separately
-        # For now, we rely on the model being available via TIMM hub
+    #     # Note: TIMM models would need to be saved separately
+    #     # For now, we rely on the model being available via TIMM hub
 
     @classmethod
     def load(cls, path: Union[str, Path]) -> "SetFitImageEncoder":
@@ -395,9 +399,13 @@ class SetFitImageEncoder:
         """Get the parameters of the underlying TIMM model for optimization.
 
         Returns:
-            Iterator of model parameters
+            Iterator of model parameters (only trainable if train_embeddings=True)
         """
-        return self.timm_model.model.parameters()
+        if self.train_embeddings:
+            return self.timm_model.model.parameters()
+        else:
+            # Return empty iterator if not training embeddings
+            return iter([])
 
     def train(self, mode: bool = True):
         """Set the model to training or evaluation mode.
@@ -406,6 +414,10 @@ class SetFitImageEncoder:
             mode: If True, set to training mode. If False, set to evaluation mode.
         """
         self.timm_model.model.train(mode)
+
+    def eval(self):
+        """Set the model to evaluation mode."""
+        self.train(False)
 
 
 class SetFitModel(ModelHubMixin):
@@ -1160,6 +1172,7 @@ class SetFitImageModel(SetFitModel):
         model_card_data: Optional[SetFitModelCardData] = None,
         image_size: Tuple[int, int] = (224, 224),
         timm_model_name: str = "timm/resnet50.a1_in1k",
+        train_embeddings: bool = False,
         **kwargs,
     ):
         """Initialize SetFit image model.
@@ -1173,6 +1186,7 @@ class SetFitImageModel(SetFitModel):
             model_card_data: Model card data
             image_size: Input image size
             timm_model_name: TIMM model name to use
+            train_embeddings: Whether to train the TIMM model embeddings or use pretrained features only
             **kwargs: Additional arguments
         """
         # Create image encoder if not provided
@@ -1180,6 +1194,7 @@ class SetFitImageModel(SetFitModel):
             model_body = SetFitImageEncoder(
                 model_name=timm_model_name,
                 image_size=image_size,
+                train_embeddings=train_embeddings,
             )
 
         # Initialize parent class
@@ -1196,6 +1211,7 @@ class SetFitImageModel(SetFitModel):
         # Store image-specific attributes
         self.image_size = image_size
         self.timm_model_name = timm_model_name
+        self.train_embeddings = train_embeddings
 
         # Create default head if not provided
         if self.model_head is None:
@@ -1203,7 +1219,7 @@ class SetFitImageModel(SetFitModel):
             self.model_head = LogisticRegression()
 
         # Update attributes to save
-        self.attributes_to_save.update({"image_size", "timm_model_name"})
+        self.attributes_to_save.update({"image_size", "timm_model_name", "train_embeddings"})
 
     def encode(
         self,
