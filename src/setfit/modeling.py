@@ -26,7 +26,7 @@ from PIL import Image
 
 from . import logging
 from .data import SetFitDataset
-from .image_utils import TimmModelWrapper, ImageTransform, get_image_transforms
+from .image_utils import TimmModelWrapper, get_image_transforms
 from .model_card import SetFitModelCardData, generate_model_card
 from .utils import set_docstring
 
@@ -199,7 +199,7 @@ class SetFitImageEncoder:
 
     def __init__(
         self,
-        model_name: str = "resnet50",
+        model_name: str = "timm/resnet50.a1_in1k",
         pretrained: bool = True,
         image_size: Tuple[int, int] = (224, 224),
         device: Optional[Union[str, torch.device]] = None,
@@ -225,7 +225,6 @@ class SetFitImageEncoder:
 
         # Create default transform
         self.transform = get_image_transforms(
-            image_size=image_size,
             is_training=False,
             model_name=model_name,
         )
@@ -1160,7 +1159,7 @@ class SetFitImageModel(SetFitModel):
         labels: Optional[List[str]] = None,
         model_card_data: Optional[SetFitModelCardData] = None,
         image_size: Tuple[int, int] = (224, 224),
-        timm_model_name: str = "resnet50",
+        timm_model_name: str = "timm/resnet50.a1_in1k",
         **kwargs,
     ):
         """Initialize SetFit image model.

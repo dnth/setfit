@@ -3,12 +3,13 @@ from pathlib import Path
 
 import pandas as pd
 import torch
+import torchvision.transforms as transforms
 from datasets import Dataset, DatasetDict, load_dataset
 from torch.utils.data import Dataset as TorchDataset
 from PIL import Image
 
 from . import logging
-from .image_utils import ImageTransform, get_image_transforms, load_image, create_image_dataset_from_directory
+from .image_utils import get_image_transforms, load_image, create_image_dataset_from_directory
 
 
 logging.set_verbosity_info()
@@ -286,18 +287,21 @@ class SetFitImageDataset(TorchDataset):
             A list of image paths that will be fed into `SetFitImageModel`.
         y (`Union[List[int], List[List[int]]]`):
             A list of labels corresponding to the images. Can be a nested list for multi-label classification.
-        transform (`ImageTransform`, *optional*):
+        transform (`transforms.Compose`, *optional*):
             The image transformation pipeline to apply. If None, uses default transforms.
         image_size (`Tuple[int, int]`, defaults to `(224, 224)`):
             The target size for images (height, width).
+        model_name (`str`, *optional*):
+            TIMM model name for getting appropriate transforms. Required if transform is None.
     """
 
     def __init__(
         self,
         x: List[Union[str, Path]],
         y: Union[List[int], List[List[int]]],
-        transform: Optional[ImageTransform] = None,
+        transform: Optional[transforms.Compose] = None,
         image_size: Tuple[int, int] = (224, 224),
+        model_name: Optional[str] = None,
     ) -> None:
         assert len(x) == len(y)
 
@@ -307,8 +311,10 @@ class SetFitImageDataset(TorchDataset):
 
         # Create default transform if not provided
         if transform is None:
+            if model_name is None:
+                raise ValueError("model_name must be provided if transform is None")
             transform = get_image_transforms(
-                image_size=image_size,
+                model_name=model_name,
                 is_training=True,
             )
         self.transform = transform

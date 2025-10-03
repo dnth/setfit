@@ -26,8 +26,6 @@ from .sampler import ContrastiveDataset
 from .training_args import TrainingArguments
 from .utils import BestRun, default_hp_space_optuna
 from .data import SetFitImageDataset
-from .image_utils import ImageTransform
-
 
 if TYPE_CHECKING:
     import optuna
