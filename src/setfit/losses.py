@@ -91,7 +91,8 @@ class SupConLoss(nn.Module):
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
 
         # Compute mean of log-likelihood over positive
-        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+        # Add small epsilon to prevent division by zero
+        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-8)
 
         # Loss
         loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos
@@ -172,7 +173,8 @@ class SupConLoss(nn.Module):
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
 
         # Compute mean of log-likelihood over positive
-        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+        # Add small epsilon to prevent division by zero
+        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-8)
 
         # Loss
         loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos

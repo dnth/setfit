@@ -751,8 +751,15 @@ class Trainer(ColumnMappingMixin):
         loss = SupConLoss(self.model.model_body)
 
         # Set up optimizer for image model body
+        # Only optimize parameters that require gradients
+        params_to_optimize = [p for p in self.model.model_body.parameters() if p.requires_grad]
+        
+        if len(params_to_optimize) == 0:
+            logger.warning("No parameters to optimize. Skipping embedding training.")
+            return
+        
         optimizer = torch.optim.AdamW(
-            self.model.model_body.parameters(),
+            params_to_optimize,
             lr=args.body_embedding_learning_rate,
             weight_decay=args.l2_weight,
         )
@@ -781,6 +788,10 @@ class Trainer(ColumnMappingMixin):
                 # Move to device
                 images = images.to(self.model.device)
                 labels = labels.to(self.model.device)
+                
+                # Skip empty batches
+                if len(images) == 0 or len(labels) == 0:
+                    continue
 
                 optimizer.zero_grad()
 
@@ -791,6 +802,13 @@ class Trainer(ColumnMappingMixin):
                 # For image models, embeddings are already computed, so use compute_loss_from_embeddings directly
                 embeddings_list = [embeddings[i] for i in range(embeddings.size(0))]
                 batch_loss = loss.compute_loss_from_embeddings(embeddings_list, labels)
+                
+                # Check for NaN loss and log a warning
+                if torch.isnan(batch_loss).any() or torch.isinf(batch_loss).any():
+                    logger.warning(f"NaN or Inf loss detected: {batch_loss.item()}. This may be due to batch composition. Consider increasing batch size or checking label distribution in batch.")
+                    # Skip this batch if loss is invalid
+                    continue
+                
                 batch_loss.backward()
                 optimizer.step()
 
