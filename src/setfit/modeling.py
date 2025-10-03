@@ -275,7 +275,14 @@ class SetFitImageEncoder:
         if isinstance(images, list) and isinstance(images[0], Image.Image):
             all_embeddings = []
 
-            for i in range(0, len(images), batch_size):
+            # Prepare batch iterator with optional progress bar
+            batch_range = range(0, len(images), batch_size)
+            if show_progress_bar:
+                batch_iter = tqdm(batch_range, desc="Encoding images", unit="batch")
+            else:
+                batch_iter = batch_range
+
+            for i in batch_iter:
                 batch = images[i:i + batch_size]
 
                 # Convert PIL images to tensors
